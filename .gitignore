@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 logs/
 *.parquet
-*.pkl
+# Keep topology_classifier.pkl (trained model)
+# *.pkl
 *.pth
 *.npz
