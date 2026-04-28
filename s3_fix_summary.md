@@ -59,25 +59,12 @@ Per-file download time drops from ~0.5–1 s to ~0.03–0.1 s. With 16 workers a
 a total per-file time of ~0.55 s (down from ~1.5 s), expected throughput is
 **~25–30 files/s** — roughly a **10x improvement**.
 
-## Further Optimizations (if needed)
-
-1. **Increase workers to 32–48**: With download overhead eliminated, the
-   bottleneck shifts to CPU (trimesh + feature extraction). More workers on
-   multi-core nodes will scale linearly.
-
-2. **Producer-consumer prefetch**: Dedicated download threads feeding a queue to
-   processing workers, fully overlapping I/O with compute.
-
-3. **S3 VPC gateway endpoint**: If the SLURM cluster runs on AWS, a VPC
-   endpoint keeps S3 traffic on the AWS backbone instead of traversing the
-   public internet.
-
-4. **In-memory loading**: Stream files into `BytesIO` via
-   `s3.download_fileobj()` and pass to `trimesh.load(file_obj, file_type=ext)`
-   to skip temp file disk I/O. Works for GLB/STL/PLY; less reliable for OBJ
-   (which references .mtl files).
-
 ## Dependencies
 
 `boto3` and `botocore` — already installed on any system with the AWS CLI.
 No new packages required.
+
+## See Also
+
+- `pipeline_optimizations.md` — additional algorithmic and infrastructure
+  improvements (checkpointing, vectorized UV features, backpressure, etc.)

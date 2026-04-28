@@ -25,7 +25,8 @@ from botocore.config import Config as BotoConfig
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import itertools
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 
@@ -35,6 +36,8 @@ from config import CLASSIFIER_PATH, FEATURE_COLUMNS, MIN_FACES, MAX_FACES
 MESH_EXTENSIONS = {'.glb', '.gltf', '.obj', '.stl', '.fbx', '.ply'}
 NUM_WORKERS = 16
 FLUSH_EVERY = 5000
+CHECKPOINT_EVERY = 10000
+TEMP_DIR = os.environ.get('TMPDIR', '/tmp')
 
 # Globals loaded once per worker process via initializer
 _clf = None
@@ -70,7 +73,7 @@ def _process_one(s3_path):
 
     uid = Path(s3_path).stem
 
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False, dir=TEMP_DIR) as tmp:
         tmp_path = tmp.name
 
     try:
@@ -123,48 +126,90 @@ def _process_one(s3_path):
             pass
 
 
+def _save_results(results, output_path):
+    """Write results list to parquet."""
+    if not results:
+        return
+    table = pa.Table.from_pylist(results)
+    pq.write_table(table, str(output_path))
+
+
+def _load_checkpoint(checkpoint_path):
+    """Load partial results and the set of already-processed S3 paths."""
+    if not os.path.exists(checkpoint_path):
+        return [], set()
+    table = pq.read_table(str(checkpoint_path))
+    results = table.to_pylist()
+    done = {r['s3_path'] for r in results}
+    return results, done
+
+
 def process_batch(batch_file, output_path, num_workers=NUM_WORKERS):
     """Process one batch file of S3 paths."""
     with open(batch_file) as f:
         s3_paths = [line.strip() for line in f if line.strip()]
 
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = output_path.with_suffix('.checkpoint.parquet')
+
+    results, done_paths = _load_checkpoint(checkpoint_path)
+    if done_paths:
+        s3_paths = [p for p in s3_paths if p not in done_paths]
+        print(f"Resumed from checkpoint: {len(done_paths)} already done, "
+              f"{len(s3_paths)} remaining")
+
+    accepted = len(results)
+    total_paths = len(s3_paths) + len(done_paths)
+
     print(f"Processing {len(s3_paths)} files from {batch_file}")
     print(f"Workers: {num_workers}")
     print(f"Output: {output_path}")
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-    results = []
     processed = 0
-    accepted = 0
     t0 = time.time()
 
     with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker) as pool:
-        futures = {pool.submit(_process_one, s3p): s3p for s3p in s3_paths}
+        pending = set()
+        path_iter = iter(s3_paths)
+        submit_size = num_workers * 4
 
-        for future in as_completed(futures):
-            processed += 1
-            try:
-                result = future.result(timeout=180)
-                if result is not None:
-                    results.append(result)
-                    accepted += 1
-            except Exception:
-                pass
+        for s3p in itertools.islice(path_iter, submit_size):
+            pending.add(pool.submit(_process_one, s3p))
 
-            if processed % FLUSH_EVERY == 0:
+        while pending:
+            done_futures, pending = wait(pending, return_when=FIRST_COMPLETED)
+
+            for future in done_futures:
+                processed += 1
+                try:
+                    result = future.result(timeout=180)
+                    if result is not None:
+                        results.append(result)
+                        accepted += 1
+                except Exception:
+                    pass
+
+            for s3p in itertools.islice(path_iter, len(done_futures)):
+                pending.add(pool.submit(_process_one, s3p))
+
+            total_processed = processed + len(done_paths)
+            if processed % FLUSH_EVERY < len(done_futures):
                 elapsed = time.time() - t0
-                rate = processed / elapsed
-                print(f"  {processed}/{len(s3_paths)} processed, "
+                rate = processed / elapsed if elapsed > 0 else 0
+                print(f"  {total_processed}/{total_paths} processed, "
                       f"{accepted} accepted, {rate:.1f} files/s", flush=True)
 
+            if processed % CHECKPOINT_EVERY < len(done_futures):
+                _save_results(results, checkpoint_path)
+
     elapsed = time.time() - t0
-    print(f"\nDone: {processed} processed, {accepted} accepted in {elapsed:.0f}s "
+    total_processed = processed + len(done_paths)
+    print(f"\nDone: {total_processed} processed, {accepted} accepted in {elapsed:.0f}s "
           f"({processed / elapsed:.1f} files/s)")
 
     if results:
-        table = pa.Table.from_pylist(results)
-        pq.write_table(table, str(output_path))
+        _save_results(results, output_path)
         print(f"Saved {len(results)} results to {output_path}")
 
         probs = np.array([r['artist_prob'] for r in results])
@@ -173,6 +218,9 @@ def process_batch(batch_file, output_path, num_workers=NUM_WORKERS):
             print(f"  P >= {t}: {n:>6d} ({n / len(probs) * 100:.1f}%)")
     else:
         print("No results to save.")
+
+    if os.path.exists(checkpoint_path):
+        os.unlink(checkpoint_path)
 
     return len(results)
 

@@ -120,14 +120,7 @@ def compute_uv_island_features(mesh):
         }
 
     uv_rounded = np.round(uv, decimals=6)
-    unique_map = {}
-    uv_idx = []
-    for row in uv_rounded:
-        key = tuple(row)
-        if key not in unique_map:
-            unique_map[key] = len(unique_map)
-        uv_idx.append(unique_map[key])
-    uv_idx = np.array(uv_idx)
+    _, uv_idx = np.unique(uv_rounded, axis=0, return_inverse=True)
 
     if len(uv_idx) == n_faces * 3:
         face_uv = uv_idx.reshape(n_faces, 3)
@@ -159,14 +152,22 @@ def compute_uv_island_features(mesh):
         if uf_rank[ra] == uf_rank[rb]:
             uf_rank[ra] += 1
 
-    uv_edge_to_face = {}
-    for fi in range(n_faces):
-        for j in range(3):
-            e = tuple(sorted([int(face_uv[fi, j]), int(face_uv[fi, (j + 1) % 3])]))
-            if e in uv_edge_to_face:
-                union(fi, uv_edge_to_face[e])
-            else:
-                uv_edge_to_face[e] = fi
+    e0 = np.stack([face_uv[:, 0], face_uv[:, 1]], axis=1)
+    e1 = np.stack([face_uv[:, 1], face_uv[:, 2]], axis=1)
+    e2 = np.stack([face_uv[:, 2], face_uv[:, 0]], axis=1)
+    all_edges = np.concatenate([e0, e1, e2], axis=0)
+    all_edges.sort(axis=1)
+    face_ids = np.tile(np.arange(n_faces), 3)
+
+    n_uv_verts = int(all_edges.max()) + 1
+    edge_keys = all_edges[:, 0].astype(np.int64) * n_uv_verts + all_edges[:, 1].astype(np.int64)
+    order = np.argsort(edge_keys)
+    edge_keys_sorted = edge_keys[order]
+    face_ids_sorted = face_ids[order]
+
+    mask = edge_keys_sorted[:-1] == edge_keys_sorted[1:]
+    for i in np.nonzero(mask)[0]:
+        union(int(face_ids_sorted[i]), int(face_ids_sorted[i + 1]))
 
     island_map = {}
     for fi in range(n_faces):
@@ -236,9 +237,9 @@ def compute_topology_features(mesh, obj_path=None):
     else:
         feat['quad_ratio'] = SENTINEL
 
-    # 6-8. Face aspect ratio
-    if n_faces > 0:
-        fv = mesh.vertices[mesh.faces]
+    # 6-8. Face aspect ratio (fv and edge lengths reused for feature 12)
+    fv = mesh.vertices[mesh.faces] if n_faces > 0 else None
+    if fv is not None:
         e01 = np.linalg.norm(fv[:, 1] - fv[:, 0], axis=1)
         e12 = np.linalg.norm(fv[:, 2] - fv[:, 1], axis=1)
         e20 = np.linalg.norm(fv[:, 0] - fv[:, 2], axis=1)
@@ -249,6 +250,7 @@ def compute_topology_features(mesh, obj_path=None):
         feat['aspect_ratio_p95'] = float(np.percentile(ar, 95))
         feat['pct_sliver_faces'] = float(np.mean(ar > 10))
     else:
+        e01 = e12 = e20 = None
         feat['aspect_ratio_mean'] = 0.0
         feat['aspect_ratio_p95'] = 0.0
         feat['pct_sliver_faces'] = 0.0
@@ -287,14 +289,9 @@ def compute_topology_features(mesh, obj_path=None):
         n_comp = 1
     feat['n_components'] = float(n_comp)
 
-    # 12. Edge length CV
-    if n_faces > 0:
-        fv = mesh.vertices[mesh.faces]
-        all_len = np.concatenate([
-            np.linalg.norm(fv[:, 1] - fv[:, 0], axis=1),
-            np.linalg.norm(fv[:, 2] - fv[:, 1], axis=1),
-            np.linalg.norm(fv[:, 0] - fv[:, 2], axis=1),
-        ])
+    # 12. Edge length CV (reuses edge lengths from feature 6-8)
+    if e01 is not None:
+        all_len = np.concatenate([e01, e12, e20])
         feat['edge_length_cv'] = float(np.std(all_len) / (np.mean(all_len) + 1e-10))
     else:
         feat['edge_length_cv'] = 0.0
