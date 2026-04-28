@@ -13,7 +13,6 @@ Usage:
     python3.11 filter_objaverse.py --batch-dir /path/to/batch_lists --output-dir /path/to/results
 """
 
-import subprocess
 import tempfile
 import os
 import sys
@@ -21,6 +20,8 @@ import argparse
 import time
 import numpy as np
 import joblib
+import boto3
+from botocore.config import Config as BotoConfig
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pathlib import Path
@@ -35,13 +36,28 @@ MESH_EXTENSIONS = {'.glb', '.gltf', '.obj', '.stl', '.fbx', '.ply'}
 NUM_WORKERS = 16
 FLUSH_EVERY = 5000
 
-# Global classifier (loaded once per worker process via initializer)
+# Globals loaded once per worker process via initializer
 _clf = None
+_s3 = None
 
 
 def _init_worker():
-    global _clf
+    global _clf, _s3
     _clf = joblib.load(str(CLASSIFIER_PATH))
+    _s3 = boto3.client(
+        's3',
+        config=BotoConfig(
+            max_pool_connections=10,
+            retries={'max_attempts': 3, 'mode': 'adaptive'},
+        ),
+    )
+
+
+def _parse_s3_uri(uri):
+    """'s3://bucket/key' -> (bucket, key)"""
+    no_scheme = uri[5:]
+    bucket, _, key = no_scheme.partition('/')
+    return bucket, key
 
 
 def _process_one(s3_path):
@@ -58,13 +74,10 @@ def _process_one(s3_path):
         tmp_path = tmp.name
 
     try:
-        proc = subprocess.run(
-            ['aws', 's3', 'cp', s3_path, tmp_path, '--quiet'],
-            capture_output=True, timeout=120,
-        )
-        if proc.returncode != 0:
-            return None
-        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) < 1024:
+        bucket, key = _parse_s3_uri(s3_path)
+        _s3.download_file(bucket, key, tmp_path)
+
+        if os.path.getsize(tmp_path) < 1024:
             return None
 
         meshes = load_meshes_from_file(tmp_path)
